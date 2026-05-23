@@ -48,6 +48,10 @@ _MIME_SEP = "|"
 _DEFAULT_VIDEO_MIME = "video/mp4"
 _DEFAULT_IMAGE_MIME = "image/jpeg"
 
+# Depth of recursive walk at the root of ROOT_FOLDER_PATH. Our upload service
+# uses `<root>/YYYY/MM/<file>` so 3 levels (root → YYYY → MM → file) is enough.
+_ROOT_RECURSE_DEPTH = 3
+
 
 async def async_get_media_source(hass: HomeAssistant) -> MediaSource:
     """Return the gdrive_upload media source (called by HA at startup)."""
@@ -122,17 +126,52 @@ class GdriveUploadMediaSource(MediaSource):
 
         raise Unresolvable(f"Cannot browse non-folder identifier: {identifier!r}")
 
+    async def _list_descendant_media(
+        self, api: DriveApi, folder_id: str, depth: int
+    ) -> list[dict]:
+        """Recursively list video/image files under folder_id (no folder entries).
+
+        Used at the root browse so the gallery card sees a flat, date-sortable
+        list instead of having to navigate `YYYY/MM/` subfolders itself — the
+        card's `path_datetime_format` only describes filenames, not folder
+        layouts, so without this flattening it would find nothing.
+        """
+        result: list[dict] = []
+        if depth <= 0:
+            return result
+        entries = await api.list_folder(folder_id)
+        for entry in entries:
+            if _is_folder(entry):
+                result.extend(
+                    await self._list_descendant_media(api, entry["id"], depth - 1)
+                )
+                continue
+            mime = entry.get("mimeType", "")
+            if mime.startswith("video/") or mime.startswith("image/"):
+                result.append(entry)
+        return result
+
     async def _browse_folder(
         self, api: DriveApi, folder_id: str, name: str, is_root: bool = False
     ) -> BrowseMediaSource:
         try:
-            entries = await api.list_folder(folder_id)
+            if is_root:
+                # Flatten the YYYY/MM/<file> tree so the gallery card sees all
+                # clips at the root with full timestamps in their filenames.
+                entries = await self._list_descendant_media(
+                    api, folder_id, _ROOT_RECURSE_DEPTH
+                )
+                # The walk visits folders in createdTime-desc order; sort the
+                # merged list across folders by createdTime so cross-folder
+                # ordering is also newest-first.
+                entries.sort(key=lambda e: e.get("createdTime", ""), reverse=True)
+            else:
+                entries = await api.list_folder(folder_id)
         except DriveApiError as err:
             raise Unresolvable(f"Drive list failed: {err}") from err
 
         # Partition into folders + media, preserving the createdTime-desc order
-        # we already requested from the Drive API. (Re-sorting alphabetically
-        # would invert chronological order at year boundaries.)
+        # we already requested from the Drive API.
         folders: list[BrowseMediaSource] = []
         files: list[BrowseMediaSource] = []
         for entry in entries:
