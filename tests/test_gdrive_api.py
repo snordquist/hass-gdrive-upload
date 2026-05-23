@@ -139,3 +139,40 @@ async def test_ensure_folder_raises_on_5xx():
     with pytest.raises(api.DriveApiError) as exc:
         await wrapper.ensure_folder("Anything")
     assert "500" in str(exc.value)
+
+
+@pytest.mark.asyncio
+async def test_list_folder_returns_children():
+    request = AsyncMock()
+    request.return_value = FakeResponse(
+        200,
+        {
+            "files": [
+                {"id": "sub1", "name": "2026", "mimeType": "application/vnd.google-apps.folder"},
+                {"id": "vid1", "name": "clip.mp4", "mimeType": "video/mp4", "size": "5000"},
+            ]
+        },
+    )
+    wrapper = api.DriveApi(request)
+    children = await wrapper.list_folder("PARENT_ID")
+    assert len(children) == 2
+    assert children[0]["id"] == "sub1"
+    assert children[1]["mimeType"] == "video/mp4"
+    # query must filter by parent + not trashed
+    call_params = request.call_args.kwargs["params"]
+    assert "'PARENT_ID' in parents" in call_params["q"]
+    assert "trashed = false" in call_params["q"]
+
+
+@pytest.mark.asyncio
+async def test_get_file_returns_metadata():
+    request = AsyncMock()
+    request.return_value = FakeResponse(
+        200, {"id": "F1", "name": "x.mp4", "mimeType": "video/mp4", "size": "1234"}
+    )
+    wrapper = api.DriveApi(request)
+    meta = await wrapper.get_file("F1")
+    assert meta["id"] == "F1"
+    assert meta["mimeType"] == "video/mp4"
+    assert request.call_args.args[0] == "GET"
+    assert "files/F1" in request.call_args.args[1]

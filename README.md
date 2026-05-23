@@ -14,8 +14,9 @@ Home Assistant's built-in `google_drive` integration is backup-only: it exposes 
 - Single service: `gdrive_upload.upload`
 - Creates Drive folder paths recursively if missing (e.g. `Photos/2026/05/`)
 - Returns Drive file ID, web view link, and (optionally) an anyone-with-link share URL — all synchronously in the service response, so the calling automation can chain notifications
+- Exposes uploads as a **Home Assistant Media Source** (`media-source://gdrive_upload/`), so the standard Media Browser, Camera Gallery Card, and any other media-source-aware component can browse and play files directly from Drive
 - Automatic token refresh via Home Assistant's `OAuth2Session` helper
-- Tiny footprint: ~200 lines of code, no extra Python dependencies
+- Tiny footprint: ~250 lines of code, no extra Python dependencies
 
 ## Requirements
 
@@ -104,6 +105,25 @@ script:
 The integration retrieves the OAuth client implementation from the `google_drive` config entry, constructs an `OAuth2Session` bound to that entry, and uses it to call the Drive API. Token refresh and 401 retries are handled by Home Assistant's OAuth helper.
 
 The Drive `drive.file` scope (which `google_drive` requests) permits the app to create files and manage files it created — including sharing — which covers everything this integration does.
+
+## Browsing uploads as a Media Source
+
+Once installed and configured, the integration registers a media source called **Google Drive Upload** that lands in the Drive folder `HomeAssistant/` (the parent the upload service uses by default). Subfolders are expanded on demand; videos and images are playable inline via the Drive `?export=download` URL — provided the file has anyone-with-link permission (the upload service sets this when called with `share: true`).
+
+Media-source URI: `media-source://gdrive_upload/`
+
+In a Lovelace card that accepts a media source list — e.g. [Camera Gallery Card](https://github.com/TheScubaDiver/camera-gallery-card):
+
+```yaml
+type: custom:camera-gallery-card
+source_mode: media
+media_sources:
+  - media-source://media_source/local/doorbell    # local cache
+  - media-source://gdrive_upload/                  # Drive archive
+path_datetime_format: YYYY-MM-DD_HH-mm-ss
+```
+
+The Drive `drive.file` OAuth scope means this integration can only see files the integration itself uploaded — anything you added to Drive via the web UI or another app is invisible to it.
 
 ## Limitations
 

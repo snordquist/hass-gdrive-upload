@@ -107,3 +107,26 @@ class DriveApi:
         if resp.status not in (200, 201):
             raise DriveApiError(f"make_shareable: {resp.status} {await resp.text()}")
         return f"https://drive.google.com/file/d/{file_id}/view"
+
+    async def list_folder(self, folder_id: str) -> list[dict]:
+        """List immediate children of a folder (files + subfolders), newest first."""
+        params = {
+            "q": f"'{folder_id}' in parents and trashed = false",
+            "fields": "files(id,name,mimeType,size,thumbnailLink,createdTime)",
+            "pageSize": "200",
+            "orderBy": "createdTime desc",
+        }
+        resp = await self._request("GET", DRIVE_API_FILES, params=params)
+        if resp.status != 200:
+            raise DriveApiError(f"list_folder {folder_id}: {resp.status} {await resp.text()}")
+        return (await resp.json()).get("files", [])
+
+    async def get_file(self, file_id: str) -> dict:
+        """Get metadata for a single file."""
+        params = {"fields": "id,name,mimeType,size,thumbnailLink,webContentLink"}
+        resp = await self._request(
+            "GET", f"{DRIVE_API_FILES}/{file_id}", params=params
+        )
+        if resp.status != 200:
+            raise DriveApiError(f"get_file {file_id}: {resp.status} {await resp.text()}")
+        return await resp.json()
