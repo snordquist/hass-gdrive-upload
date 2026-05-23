@@ -112,6 +112,8 @@ Once installed and configured, the integration registers a media source called *
 
 Media-source URI: `media-source://gdrive_upload/`
 
+The integration registers `ROOT_FOLDER_PATH = "HomeAssistant/Doorbell"` as the browse entry point. Subfolders below that (e.g. `2026/05/`) are expanded on demand. Anything you upload via the service into a different folder is invisible to the browser but still reachable by file id.
+
 In a Lovelace card that accepts a media source list — e.g. [Camera Gallery Card](https://github.com/TheScubaDiver/camera-gallery-card):
 
 ```yaml
@@ -122,6 +124,13 @@ media_sources:
   - media-source://gdrive_upload/                  # Drive archive
 path_datetime_format: YYYY-MM-DD_HH-mm-ss
 ```
+
+### Playback
+
+Files are streamed through an internal Home Assistant HTTP view (`/api/gdrive_upload/stream/<file_id>`). The browser uses its existing HA session cookie; the server uses the gdrive_upload OAuth session to fetch the bytes from Drive. This means:
+
+- Inline `<video>` playback works regardless of the file's share state — anyone-with-link permission is not required.
+- A user must be signed in to Home Assistant to play a file. The stream URL leaks neither a Drive id nor a token if intercepted.
 
 The Drive `drive.file` OAuth scope means this integration can only see files the integration itself uploaded — anything you added to Drive via the web UI or another app is invisible to it.
 

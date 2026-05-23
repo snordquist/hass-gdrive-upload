@@ -23,6 +23,7 @@ from .const import (
     DOMAIN,
     SERVICE_UPLOAD,
 )
+from .view import GdriveStreamView
 
 _LOGGER = logging.getLogger(__name__)
 
@@ -58,6 +59,9 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
     api = DriveApi(_request)
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = api
+
+    # Register the streaming proxy view once (idempotent — HA dedupes by name).
+    hass.http.register_view(GdriveStreamView(hass))
 
     async def _upload(call: ServiceCall) -> dict[str, Any]:
         file_path = call.data[ATTR_FILE_PATH]

@@ -1,4 +1,14 @@
-"""Expose files uploaded by gdrive_upload as a Home Assistant media source."""
+"""Expose files uploaded by gdrive_upload as a Home Assistant media source.
+
+Identifier scheme:
+- ``""`` — the root, resolved on demand to ``ROOT_FOLDER_PATH`` in Drive.
+- ``folder:<drive_id>`` — a subfolder, expandable.
+- ``v:<drive_id>`` — a video file, playable.
+- ``i:<drive_id>`` — an image file, playable.
+
+Playback URL is an HA-internal proxy (see view.py) so the browser uses cookie
+auth and the bytes are streamed inline regardless of the file's share state.
+"""
 
 from __future__ import annotations
 
@@ -19,10 +29,14 @@ from .const import DOMAIN
 
 _LOGGER = logging.getLogger(__name__)
 
-# The folder we land in when the user opens the media browser.
-# Drive's `drive.file` scope only lets us see files we created, so this is
-# naturally limited to what gdrive_upload has uploaded.
-ROOT_FOLDER_PATH = "HomeAssistant"
+# Drive folder we expose. Scoped to the doorbell sub-tree so unrelated uploads
+# (e.g. logs the user may decide to push via the upload service later) do not
+# end up in a gallery card that expects timestamp-named media filenames.
+ROOT_FOLDER_PATH = "HomeAssistant/Doorbell"
+
+_PREFIX_FOLDER = "folder:"
+_PREFIX_VIDEO = "v:"
+_PREFIX_IMAGE = "i:"
 
 
 async def async_get_media_source(hass: HomeAssistant) -> MediaSource:
@@ -42,14 +56,16 @@ def _is_folder(item: dict) -> bool:
     return item.get("mimeType") == "application/vnd.google-apps.folder"
 
 
-def _media_class_for(mime: str) -> MediaClass:
+def _identifier_for(entry: dict) -> str | None:
+    """Return an identifier for a Drive list entry, or None if not browsable."""
+    if _is_folder(entry):
+        return f"{_PREFIX_FOLDER}{entry['id']}"
+    mime = entry.get("mimeType", "")
     if mime.startswith("video/"):
-        return MediaClass.VIDEO
+        return f"{_PREFIX_VIDEO}{entry['id']}"
     if mime.startswith("image/"):
-        return MediaClass.IMAGE
-    if mime.startswith("audio/"):
-        return MediaClass.MUSIC
-    return MediaClass.URL
+        return f"{_PREFIX_IMAGE}{entry['id']}"
+    return None
 
 
 class GdriveUploadMediaSource(MediaSource):
@@ -62,19 +78,17 @@ class GdriveUploadMediaSource(MediaSource):
         self.hass = hass
 
     async def async_resolve_media(self, item: MediaSourceItem) -> PlayMedia:
-        """Resolve a file's media-source identifier to a playable URL."""
-        api = _get_api(self.hass)
-        file_id = item.identifier
-        if not file_id or file_id.startswith("folder:"):
-            raise Unresolvable("Cannot play a folder")
-        try:
-            meta = await api.get_file(file_id)
-        except DriveApiError as err:
-            raise Unresolvable(f"Drive get_file failed: {err}") from err
-        # Public download URL works for browser <video src> when the file has
-        # anyone-with-link permission (our pipeline always uploads with share=true).
-        url = f"https://drive.google.com/uc?export=download&id={file_id}"
-        return PlayMedia(url, meta.get("mimeType", "application/octet-stream"))
+        """Resolve a playable item to an HA-internal proxy URL."""
+        ident = item.identifier or ""
+        if ident.startswith(_PREFIX_VIDEO):
+            file_id = ident[len(_PREFIX_VIDEO) :]
+            mime = "video/mp4"
+        elif ident.startswith(_PREFIX_IMAGE):
+            file_id = ident[len(_PREFIX_IMAGE) :]
+            mime = "image/jpeg"
+        else:
+            raise Unresolvable(f"Not a playable identifier: {ident!r}")
+        return PlayMedia(f"/api/gdrive_upload/stream/{file_id}", mime)
 
     async def async_browse_media(self, item: MediaSourceItem) -> BrowseMediaSource:
         """Browse a folder. Identifier 'folder:<id>' or empty for root."""
@@ -86,28 +100,37 @@ class GdriveUploadMediaSource(MediaSource):
                 root_id = await api.ensure_folder(ROOT_FOLDER_PATH)
             except DriveApiError as err:
                 raise Unresolvable(f"Drive root resolve failed: {err}") from err
-            return await self._browse_folder(api, root_id, ROOT_FOLDER_PATH)
+            return await self._browse_folder(api, root_id, ROOT_FOLDER_PATH, is_root=True)
 
-        if not identifier.startswith("folder:"):
-            raise Unresolvable(f"Invalid browse identifier: {identifier!r}")
-        folder_id = identifier[len("folder:") :]
-        return await self._browse_folder(api, folder_id, "")
+        if identifier.startswith(_PREFIX_FOLDER):
+            folder_id = identifier[len(_PREFIX_FOLDER) :]
+            return await self._browse_folder(api, folder_id, "")
+
+        raise Unresolvable(f"Cannot browse non-folder identifier: {identifier!r}")
 
     async def _browse_folder(
-        self, api: DriveApi, folder_id: str, name: str
+        self, api: DriveApi, folder_id: str, name: str, is_root: bool = False
     ) -> BrowseMediaSource:
         try:
             entries = await api.list_folder(folder_id)
         except DriveApiError as err:
             raise Unresolvable(f"Drive list failed: {err}") from err
 
-        children: list[BrowseMediaSource] = []
+        # Partition into folders + media, preserving the createdTime-desc order
+        # we already requested from the Drive API. (Re-sorting alphabetically
+        # would invert chronological order at year boundaries.)
+        folders: list[BrowseMediaSource] = []
+        files: list[BrowseMediaSource] = []
         for entry in entries:
-            if _is_folder(entry):
-                children.append(
+            ident = _identifier_for(entry)
+            if ident is None:
+                continue  # not browsable / not media
+            mime = entry.get("mimeType", "")
+            if ident.startswith(_PREFIX_FOLDER):
+                folders.append(
                     BrowseMediaSource(
                         domain=DOMAIN,
-                        identifier=f"folder:{entry['id']}",
+                        identifier=ident,
                         media_class=MediaClass.DIRECTORY,
                         media_content_type="",
                         title=entry["name"],
@@ -116,41 +139,40 @@ class GdriveUploadMediaSource(MediaSource):
                         thumbnail=None,
                     )
                 )
-                continue
-
-            mime = entry.get("mimeType", "")
-            if not (mime.startswith("video/") or mime.startswith("image/")):
-                continue
-            children.append(
-                BrowseMediaSource(
-                    domain=DOMAIN,
-                    identifier=entry["id"],
-                    media_class=_media_class_for(mime),
-                    media_content_type=mime,
-                    title=entry["name"],
-                    can_play=True,
-                    can_expand=False,
-                    thumbnail=entry.get("thumbnailLink"),
+            else:
+                files.append(
+                    BrowseMediaSource(
+                        domain=DOMAIN,
+                        identifier=ident,
+                        media_class=(
+                            MediaClass.VIDEO
+                            if mime.startswith("video/")
+                            else MediaClass.IMAGE
+                        ),
+                        media_content_type=mime,
+                        title=entry["name"],
+                        can_play=True,
+                        can_expand=False,
+                        thumbnail=entry.get("thumbnailLink"),
+                    )
                 )
-            )
 
-        # Folder grouping: directories first, then media
-        children.sort(
-            key=lambda c: (c.media_class != MediaClass.DIRECTORY, c.title),
+        children = folders + files
+        children_media_class = (
+            MediaClass.DIRECTORY if folders else (MediaClass.VIDEO if files else MediaClass.DIRECTORY)
         )
 
+        # Root identifier stays empty so HA re-resolves the path on every visit
+        # (a path-based root is more robust than a cached id across restarts).
+        node_identifier = "" if is_root else f"{_PREFIX_FOLDER}{folder_id}"
         return BrowseMediaSource(
             domain=DOMAIN,
-            identifier=f"folder:{folder_id}" if name == "" else "",
+            identifier=node_identifier,
             media_class=MediaClass.DIRECTORY,
             media_content_type="",
             title=name or "Google Drive",
             can_play=False,
             can_expand=True,
             children=children,
-            children_media_class=(
-                MediaClass.DIRECTORY
-                if children and children[0].media_class == MediaClass.DIRECTORY
-                else MediaClass.VIDEO
-            ),
+            children_media_class=children_media_class,
         )
