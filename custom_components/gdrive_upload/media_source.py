@@ -38,6 +38,16 @@ _PREFIX_FOLDER = "folder:"
 _PREFIX_VIDEO = "v:"
 _PREFIX_IMAGE = "i:"
 
+# Identifiers carry the actual MIME type alongside the file id so resolve()
+# can return the real content type without round-tripping Drive. Encoding:
+#   v:<drive_id>|<mime>     # e.g. v:1aBc|video/mp4 or v:1aBc|video/quicktime
+#   i:<drive_id>|<mime>
+# Legacy v0.3.0 identifiers without the `|` suffix still resolve, defaulting
+# to the conventional mime per prefix.
+_MIME_SEP = "|"
+_DEFAULT_VIDEO_MIME = "video/mp4"
+_DEFAULT_IMAGE_MIME = "image/jpeg"
+
 
 async def async_get_media_source(hass: HomeAssistant) -> MediaSource:
     """Return the gdrive_upload media source (called by HA at startup)."""
@@ -62,9 +72,9 @@ def _identifier_for(entry: dict) -> str | None:
         return f"{_PREFIX_FOLDER}{entry['id']}"
     mime = entry.get("mimeType", "")
     if mime.startswith("video/"):
-        return f"{_PREFIX_VIDEO}{entry['id']}"
+        return f"{_PREFIX_VIDEO}{entry['id']}{_MIME_SEP}{mime}"
     if mime.startswith("image/"):
-        return f"{_PREFIX_IMAGE}{entry['id']}"
+        return f"{_PREFIX_IMAGE}{entry['id']}{_MIME_SEP}{mime}"
     return None
 
 
@@ -81,13 +91,17 @@ class GdriveUploadMediaSource(MediaSource):
         """Resolve a playable item to an HA-internal proxy URL."""
         ident = item.identifier or ""
         if ident.startswith(_PREFIX_VIDEO):
-            file_id = ident[len(_PREFIX_VIDEO) :]
-            mime = "video/mp4"
+            rest = ident[len(_PREFIX_VIDEO) :]
+            default_mime = _DEFAULT_VIDEO_MIME
         elif ident.startswith(_PREFIX_IMAGE):
-            file_id = ident[len(_PREFIX_IMAGE) :]
-            mime = "image/jpeg"
+            rest = ident[len(_PREFIX_IMAGE) :]
+            default_mime = _DEFAULT_IMAGE_MIME
         else:
             raise Unresolvable(f"Not a playable identifier: {ident!r}")
+        if _MIME_SEP in rest:
+            file_id, mime = rest.rsplit(_MIME_SEP, 1)
+        else:
+            file_id, mime = rest, default_mime
         return PlayMedia(f"/api/gdrive_upload/stream/{file_id}", mime)
 
     async def async_browse_media(self, item: MediaSourceItem) -> BrowseMediaSource:
@@ -158,9 +172,17 @@ class GdriveUploadMediaSource(MediaSource):
                 )
 
         children = folders + files
-        children_media_class = (
-            MediaClass.DIRECTORY if folders else (MediaClass.VIDEO if files else MediaClass.DIRECTORY)
-        )
+        if folders:
+            children_media_class = MediaClass.DIRECTORY
+        elif files:
+            # Use IMAGE only when there is not a single video among the files
+            children_media_class = (
+                MediaClass.IMAGE
+                if all(f.media_class == MediaClass.IMAGE for f in files)
+                else MediaClass.VIDEO
+            )
+        else:
+            children_media_class = MediaClass.DIRECTORY
 
         # Root identifier stays empty so HA re-resolves the path on every visit
         # (a path-based root is more robust than a cached id across restarts).
